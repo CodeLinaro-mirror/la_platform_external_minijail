@@ -123,8 +123,9 @@ struct minijail {
 	struct {
 		int uid : 1;
 		int gid : 1;
-		int usergroups : 1;
-		int suppl_gids : 1;
+		int inherit_suppl_gids : 1;
+		int set_suppl_gids : 1;
+		int keep_suppl_gids : 1;
 		int use_caps : 1;
 		int capbset_drop : 1;
 		int vfs : 1;
@@ -250,14 +251,14 @@ void API minijail_set_supplementary_gids(struct minijail *j, size_t size,
 {
 	size_t i;
 
-	if (j->flags.usergroups)
-		die("cannot inherit *and* set supplementary groups");
+	if (j->flags.inherit_suppl_gids || j->flags.keep_suppl_gids)
+		die("cannot inherit *and* set or keep supplementary groups");
 
 	if (size == 0) {
 		/* Clear supplementary groups. */
 		j->suppl_gid_list = NULL;
 		j->suppl_gid_count = 0;
-		j->flags.suppl_gids = 1;
+		j->flags.set_suppl_gids = 1;
 		return;
 	}
 
@@ -270,7 +271,11 @@ void API minijail_set_supplementary_gids(struct minijail *j, size_t size,
 		j->suppl_gid_list[i] = list[i];
 	}
 	j->suppl_gid_count = size;
-	j->flags.suppl_gids = 1;
+	j->flags.set_suppl_gids = 1;
+}
+
+void API minijail_keep_supplementary_gids(struct minijail *j) {
+	j->flags.keep_suppl_gids = 1;
 }
 
 int API minijail_change_user(struct minijail *j, const char *user)
@@ -514,7 +519,7 @@ int API minijail_gidmap(struct minijail *j, const char *gidmap)
 
 void API minijail_inherit_usergroups(struct minijail *j)
 {
-	j->flags.usergroups = 1;
+	j->flags.inherit_suppl_gids = 1;
 }
 
 void API minijail_run_as_init(struct minijail *j)
@@ -1327,32 +1332,32 @@ static void wait_for_parent_setup(int *pipe_fds)
 
 static void drop_ugid(const struct minijail *j)
 {
-	if (j->flags.usergroups && j->flags.suppl_gids) {
-		die("tried to inherit *and* set supplementary groups;"
-		    " can only do one");
+	if (j->flags.inherit_suppl_gids + j->flags.keep_suppl_gids +
+	    j->flags.set_suppl_gids > 1) {
+		die("can only either inherit, keep or set supplementary groups;"
+		    " tried to do two or more");
 	}
 
-	if (j->flags.usergroups) {
+	if (j->flags.inherit_suppl_gids) {
 		if (initgroups(j->user, j->usergid))
-			pdie("initgroups");
-	} else if (j->flags.suppl_gids) {
-		if (setgroups(j->suppl_gid_count, j->suppl_gid_list)) {
-			pdie("setgroups");
-		}
-	} else {
+			pdie("initgroups(%s, %d) failed", j->user, j->usergid);
+	} else if (j->flags.set_suppl_gids) {
+		if (setgroups(j->suppl_gid_count, j->suppl_gid_list))
+			pdie("setgroups(suppl_gids) failed");
+	} else if (!j->flags.keep_suppl_gids) {
 		/*
 		 * Only attempt to clear supplementary groups if we are changing
-		 * users.
+		 * users or groups.
 		 */
-		if ((j->uid || j->gid) && setgroups(0, NULL))
-			pdie("setgroups");
+		if ((j->flags.uid || j->flags.gid) && setgroups(0, NULL))
+			pdie("setgroups(0, NULL) failed");
 	}
 
 	if (j->flags.gid && setresgid(j->gid, j->gid, j->gid))
-		pdie("setresgid");
+		pdie("setresgid(%d, %d, %d) failed", j->gid, j->gid, j->gid);
 
 	if (j->flags.uid && setresuid(j->uid, j->uid, j->uid))
-		pdie("setresuid");
+		pdie("setresuid(%d, %d, %d) failed", j->uid, j->uid, j->uid);
 }
 
 /*
@@ -1521,7 +1526,7 @@ static void set_seccomp_filter(const struct minijail *j)
 	}
 }
 
-static void net_bring_up_loopback(void)
+static void config_net_loopback(void)
 {
 	static const char ifname[] = "lo";
 	int sock;
@@ -1564,7 +1569,7 @@ void API minijail_enter(const struct minijail *j)
 		die("tried to enter a pid-namespaced jail;"
 		    " try minijail_run()?");
 
-	if (j->flags.usergroups && !j->user)
+	if (j->flags.inherit_suppl_gids && !j->user)
 		die("usergroup inheritance without username");
 
 	/*
@@ -1573,11 +1578,11 @@ void API minijail_enter(const struct minijail *j)
 	 * entire process.
 	 */
 	if (j->flags.enter_vfs && setns(j->mountns_fd, CLONE_NEWNS))
-		pdie("setns(CLONE_NEWNS)");
+		pdie("setns(CLONE_NEWNS) failed");
 
 	if (j->flags.vfs) {
 		if (unshare(CLONE_NEWNS))
-			pdie("unshare(vfs)");
+			pdie("unshare(CLONE_NEWNS) failed");
 		/*
 		 * Unless asked not to, remount all filesystems as private.
 		 * If they are shared, new bind mounts will creep out of our
@@ -1586,25 +1591,26 @@ void API minijail_enter(const struct minijail *j)
 		 */
 		if (!j->flags.skip_remount_private) {
 			if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL))
-				pdie("mount(/, private)");
+				pdie("mount(NULL, /, NULL, MS_REC | MS_PRIVATE,"
+				     " NULL) failed");
 		}
 	}
 
 	if (j->flags.ipc && unshare(CLONE_NEWIPC)) {
-		pdie("unshare(ipc)");
+		pdie("unshare(CLONE_NEWIPC) failed");
 	}
 
 	if (j->flags.enter_net) {
 		if (setns(j->netns_fd, CLONE_NEWNET))
-			pdie("setns(CLONE_NEWNET)");
+			pdie("setns(CLONE_NEWNET) failed");
 	} else if (j->flags.net) {
 		if (unshare(CLONE_NEWNET))
-			pdie("unshare(net)");
-		net_bring_up_loopback();
+			pdie("unshare(CLONE_NEWNET) failed");
+		config_net_loopback();
 	}
 
 	if (j->flags.ns_cgroups && unshare(CLONE_NEWCGROUP))
-		pdie("unshare(cgroups)");
+		pdie("unshare(CLONE_NEWCGROUP) failed");
 
 	if (j->flags.chroot && enter_chroot(j))
 		pdie("chroot");
@@ -1634,7 +1640,7 @@ void API minijail_enter(const struct minijail *j)
 		 * lock securebits.
 		 */
 		if (prctl(PR_SET_KEEPCAPS, 1))
-			pdie("prctl(PR_SET_KEEPCAPS)");
+			pdie("prctl(PR_SET_KEEPCAPS) failed");
 
 		/*
 		 * Kernels 4.3+ define a new securebit
@@ -1654,7 +1660,7 @@ void API minijail_enter(const struct minijail *j)
 			}
 		}
 		if (securebits_ret < 0)
-			pdie("prctl(PR_SET_SECUREBITS)");
+			pdie("prctl(PR_SET_SECUREBITS) failed");
 	}
 
 	if (j->flags.no_new_privs) {
@@ -1685,7 +1691,7 @@ void API minijail_enter(const struct minijail *j)
 	 */
 	if (j->flags.alt_syscall) {
 		if (prctl(PR_ALT_SYSCALL, 1, j->alt_syscall_table))
-			pdie("prctl(PR_ALT_SYSCALL)");
+			pdie("prctl(PR_ALT_SYSCALL) failed");
 	}
 
 	/*
@@ -1697,7 +1703,7 @@ void API minijail_enter(const struct minijail *j)
 			warn("seccomp not supported");
 			return;
 		}
-		pdie("prctl(PR_SET_SECCOMP)");
+		pdie("prctl(PR_SET_SECCOMP) failed");
 	}
 }
 
@@ -1957,19 +1963,24 @@ int minijail_run_internal(struct minijail *j, const char *filename,
 
 	if (!use_preload) {
 		if (j->flags.use_caps && j->caps != 0)
-			die("non-empty capabilities are not supported without LD_PRELOAD");
+			die("non-empty capabilities are not supported without "
+			    "LD_PRELOAD");
 	}
 
 	/*
-	 * Make the process group ID of this process equal to its PID, so that
-	 * both the Minijail process and the jailed process can be killed
-	 * together.
+	 * Make the process group ID of this process equal to its PID.
+	 * In the non-interactive case (e.g. when the parent process is started
+	 * from init) this ensures the parent process and the jailed process
+	 * can be killed together.
+	 * When the parent process is started from the console this ensures
+	 * the call to setsid(2) in the jailed process succeeds.
+	 *
 	 * Don't fail on EPERM, since setpgid(0, 0) can only EPERM when
 	 * the process is already a process group leader.
 	 */
 	if (setpgid(0 /* use calling PID */, 0 /* make PGID = PID */)) {
 		if (errno != EPERM) {
-			pdie("setpgid(0, 0)");
+			pdie("setpgid(0, 0) failed");
 		}
 	}
 
@@ -2217,6 +2228,19 @@ int minijail_run_internal(struct minijail *j, const char *filename,
 		if (setup_and_dupe_pipe_end(stderr_fds, 1 /* write end */,
 					    STDERR_FILENO) < 0)
 			die("failed to set up stderr pipe");
+	}
+
+	/*
+	 * If any of stdin, stdout, or stderr are TTYs, create a new session.
+	 * This prevents the jailed process from using the TIOCSTI ioctl
+	 * to push characters into the parent process terminal's input buffer,
+	 * therefore escaping the jail.
+	 */
+	if (isatty(STDIN_FILENO) || isatty(STDOUT_FILENO) ||
+	    isatty(STDERR_FILENO)) {
+		if (setsid() < 0) {
+			pdie("setsid() failed");
+		}
 	}
 
 	/* If running an init program, let it decide when/how to mount /proc. */
