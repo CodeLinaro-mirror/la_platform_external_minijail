@@ -251,8 +251,10 @@ void API minijail_set_supplementary_gids(struct minijail *j, size_t size,
 {
 	size_t i;
 
-	if (j->flags.inherit_suppl_gids || j->flags.keep_suppl_gids)
-		die("cannot inherit *and* set or keep supplementary groups");
+	if (j->flags.inherit_suppl_gids)
+		die("cannot inherit *and* set supplementary groups");
+	if (j->flags.keep_suppl_gids)
+		die("cannot keep *and* set supplementary groups");
 
 	if (size == 0) {
 		/* Clear supplementary groups. */
@@ -1236,7 +1238,7 @@ static int enter_pivot_root(const struct minijail *j)
 
 static int mount_tmp(void)
 {
-	return mount("none", "/tmp", "tmpfs", 0, "size=64M,mode=777");
+	return mount("none", "/tmp", "tmpfs", 0, "size=64M,mode=1777");
 }
 
 static int remount_proc_readonly(const struct minijail *j)
@@ -1262,7 +1264,7 @@ static int remount_proc_readonly(const struct minijail *j)
 			return -errno;
 		}
 	}
-	if (mount("", kProcPath, "proc", kSafeFlags | MS_RDONLY, ""))
+	if (mount("proc", kProcPath, "proc", kSafeFlags | MS_RDONLY, ""))
 		return -errno;
 	return 0;
 }
@@ -1293,9 +1295,17 @@ static void write_ugid_maps_or_die(const struct minijail *j)
 {
 	if (j->uidmap && write_proc_file(j->initpid, j->uidmap, "uid_map") != 0)
 		kill_child_and_die(j, "failed to write uid_map");
-	if (j->gidmap && j->flags.disable_setgroups &&
-	    write_proc_file(j->initpid, "deny", "setgroups") != 0)
-		kill_child_and_die(j, "failed to disable setgroups(2)");
+	if (j->gidmap && j->flags.disable_setgroups) {
+		/* Older kernels might not have the /proc/<pid>/setgroups files. */
+		int ret = write_proc_file(j->initpid, "deny", "setgroups");
+		if (ret != 0) {
+			if (ret == -ENOENT) {
+				/* See http://man7.org/linux/man-pages/man7/user_namespaces.7.html. */
+				warn("could not disable setgroups(2)");
+			} else
+				kill_child_and_die(j, "failed to disable setgroups(2)");
+		}
+	}
 	if (j->gidmap && write_proc_file(j->initpid, j->gidmap, "gid_map") != 0)
 		kill_child_and_die(j, "failed to write gid_map");
 }
@@ -1334,8 +1344,8 @@ static void drop_ugid(const struct minijail *j)
 {
 	if (j->flags.inherit_suppl_gids + j->flags.keep_suppl_gids +
 	    j->flags.set_suppl_gids > 1) {
-		die("can only either inherit, keep or set supplementary groups;"
-		    " tried to do two or more");
+		die("can only do one of inherit, keep, or set supplementary "
+		    "groups");
 	}
 
 	if (j->flags.inherit_suppl_gids) {
@@ -1570,7 +1580,8 @@ void API minijail_enter(const struct minijail *j)
 		    " try minijail_run()?");
 
 	if (j->flags.inherit_suppl_gids && !j->user)
-		die("usergroup inheritance without username");
+		die("cannot inherit supplementary groups without setting a "
+		    "username");
 
 	/*
 	 * We can't recover from failures if we've dropped privileges partially,
