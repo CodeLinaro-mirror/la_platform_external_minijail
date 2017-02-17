@@ -105,6 +105,9 @@ _Static_assert(SECURE_ALL_BITS == 0x55, "SECURE_ALL_BITS == 0x55.");
 
 #define MAX_CGROUPS 10 /* 10 different controllers supported by Linux. */
 
+/* Keyctl commands. */
+#define KEYCTL_JOIN_SESSION_KEYRING 1
+
 struct mountpoint {
 	char *src;
 	char *dest;
@@ -153,6 +156,7 @@ struct minijail {
 		int alt_syscall : 1;
 		int reset_signal_mask : 1;
 		int close_open_fds : 1;
+		int new_session_keyring : 1;
 	} flags;
 	uid_t uid;
 	gid_t gid;
@@ -175,6 +179,7 @@ struct minijail {
 	struct mountpoint *mounts_head;
 	struct mountpoint *mounts_tail;
 	size_t mounts_count;
+	size_t tmpfs_size;
 	char *cgroups[MAX_CGROUPS];
 	size_t cgroup_count;
 };
@@ -434,6 +439,11 @@ void API minijail_namespace_enter_vfs(struct minijail *j, const char *ns_path)
 	j->flags.enter_vfs = 1;
 }
 
+void API minijail_new_session_keyring(struct minijail *j)
+{
+	j->flags.new_session_keyring = 1;
+}
+
 void API minijail_skip_remount_private(struct minijail *j)
 {
 	j->flags.skip_remount_private = 1;
@@ -597,8 +607,19 @@ char API *minijail_get_original_path(struct minijail *j,
 	return strdup(path_inside_chroot);
 }
 
+size_t minijail_get_tmpfs_size(const struct minijail *j)
+{
+	return j->tmpfs_size;
+}
+
 void API minijail_mount_tmp(struct minijail *j)
 {
+	minijail_mount_tmp_size(j, 64 * 1024 * 1024);
+}
+
+void API minijail_mount_tmp_size(struct minijail *j, size_t size)
+{
+	j->tmpfs_size = size;
 	j->flags.mount_tmp = 1;
 }
 
@@ -1236,10 +1257,21 @@ static int enter_pivot_root(const struct minijail *j)
 	return 0;
 }
 
-static int mount_tmp(void)
+static int mount_tmp(const struct minijail *j)
 {
+	const char fmt[] = "size=%zu,mode=1777";
+	/* Count for the user storing ULLONG_MAX literally + extra space. */
+	char data[sizeof(fmt) + sizeof("18446744073709551615ULL")];
+	int ret;
+
+	ret = snprintf(data, sizeof(data), fmt, j->tmpfs_size);
+
+	if (ret <= 0)
+		pdie("tmpfs size spec error");
+	else if ((size_t)ret >= sizeof(data))
+		pdie("tmpfs size spec too large");
 	return mount("none", "/tmp", "tmpfs", MS_NODEV | MS_NOEXEC | MS_NOSUID,
-	             "size=64M,mode=1777");
+		     data);
 }
 
 static int remount_proc_readonly(const struct minijail *j)
@@ -1624,13 +1656,18 @@ void API minijail_enter(const struct minijail *j)
 	if (j->flags.ns_cgroups && unshare(CLONE_NEWCGROUP))
 		pdie("unshare(CLONE_NEWCGROUP) failed");
 
+	if (j->flags.new_session_keyring) {
+		if (syscall(SYS_keyctl, KEYCTL_JOIN_SESSION_KEYRING, NULL) < 0)
+			pdie("keyctl(KEYCTL_JOIN_SESSION_KEYRING) failed");
+	}
+
 	if (j->flags.chroot && enter_chroot(j))
 		pdie("chroot");
 
 	if (j->flags.pivot_root && enter_pivot_root(j))
 		pdie("pivot_root");
 
-	if (j->flags.mount_tmp && mount_tmp())
+	if (j->flags.mount_tmp && mount_tmp(j))
 		pdie("mount_tmp");
 
 	if (j->flags.remount_proc_ro && remount_proc_readonly(j))

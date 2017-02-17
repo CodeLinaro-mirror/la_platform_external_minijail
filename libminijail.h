@@ -61,6 +61,8 @@ void minijail_capbset_drop(struct minijail *j, uint64_t capmask);
 void minijail_reset_signal_mask(struct minijail *j);
 void minijail_namespace_vfs(struct minijail *j);
 void minijail_namespace_enter_vfs(struct minijail *j, const char *ns_path);
+void minijail_new_session_keyring(struct minijail *j);
+
 /*
  * This option is *dangerous* as it negates most of the functionality of
  * minijail_namespace_vfs(). You very likely don't need this.
@@ -127,10 +129,16 @@ int minijail_enter_pivot_root(struct minijail *j, const char *dir);
 char *minijail_get_original_path(struct minijail *j, const char *chroot_path);
 
 /*
- * minijail_mount_tmp: enables mounting of a tmpfs filesystem on /tmp.
+ * minijail_mount_tmp: enables mounting of a 64M tmpfs filesystem on /tmp.
  * As be rules of bind mounts, /tmp must exist in chroot.
  */
 void minijail_mount_tmp(struct minijail *j);
+
+/*
+ * minijail_mount_tmp_size: enables mounting of a tmpfs filesystem on /tmp.
+ * As be rules of bind mounts, /tmp must exist in chroot.  Size is in bytes.
+ */
+void minijail_mount_tmp_size(struct minijail *j, size_t size);
 
 /*
  * minijail_mount_with_data: when entering minijail @j,

@@ -151,11 +151,13 @@ static void usage(const char *progn)
 
 	/* clang-format off */
 	printf("\n"
-	       "  -m:         Set the uid map of a user namespace (implies -pU).\n"
+	       "  -m[map]:    Set the uid map of a user namespace (implies -pU).\n"
 	       "              Same arguments as newuidmap(1), multiple mappings should be separated by ',' (comma).\n"
+	       "              With no mapping, map the current uid to root inside the user namespace.\n"
 	       "              Not compatible with -b without the 'writable' option.\n"
-	       "  -M:         Set the gid map of a user namespace (implies -pU).\n"
+	       "  -M[map]:    Set the gid map of a user namespace (implies -pU).\n"
 	       "              Same arguments as newgidmap(1), multiple mappings should be separated by ',' (comma).\n"
+	       "              With no mapping, map the current gid to root inside the user namespace.\n"
 	       "              Not compatible with -b without the 'writable' option.\n"
 	       "  -n:         Set no_new_privs.\n"
 	       "  -N:         Enter a new cgroup namespace.\n"
@@ -165,13 +167,15 @@ static void usage(const char *progn)
 	       "  -S <file>:  Set seccomp filter using <file>.\n"
 	       "              E.g., '-S /usr/share/filters/<prog>.$(uname -m)'.\n"
 	       "              Requires -n when not running as root.\n"
-	       "  -t:         Mount tmpfs at /tmp (implies -v).\n"
+	       "  -t[size]:   Mount tmpfs at /tmp (implies -v).\n"
+	       "              Optional argument specifies size (default \"64M\").\n"
 	       "  -T <type>:  Don't access <program> before execve(2), assume <type> ELF binary.\n"
 	       "              <type> must be 'static' or 'dynamic'.\n"
 	       "  -u <user>:  Change uid to <user>.\n"
 	       "  -U:         Enter new user namespace (implies -p).\n"
 	       "  -v:         Enter new mount namespace.\n"
 	       "  -V <file>:  Enter specified mount namespace.\n"
+	       "  -w:         Create and join a new anonymous session keyring.\n"
 	       "  -Y:         Synchronize seccomp filters across thread group.\n");
 	/* clang-format on */
 }
@@ -197,12 +201,13 @@ static int parse_args(struct minijail *j, int argc, char *argv[],
 	int inherit_suppl_gids = 0, keep_suppl_gids = 0;
 	const size_t path_max = 4096;
 	char *map;
+	size_t size;
 	const char *filter_path;
 	if (argc > 1 && argv[1][0] != '-')
 		return 1;
 
 	const char *optstring =
-	    "u:g:sS:c:C:P:b:V:f:m::M::k:a:e::T:vrGhHinNplLtIUKyY";
+	    "u:g:sS:c:C:P:b:V:f:m::M::k:a:e::T:vrGhHinNplLt::IUKwyY";
 	while ((opt = getopt(argc, argv, optstring)) != -1) {
 		switch (opt) {
 		case 'u':
@@ -286,7 +291,12 @@ static int parse_args(struct minijail *j, int argc, char *argv[],
 			break;
 		case 't':
 			minijail_namespace_vfs(j);
-			minijail_mount_tmp(j);
+			size = 64 * 1024 * 1024;
+			if (optarg != NULL && 0 != parse_size(&size, optarg)) {
+				fprintf(stderr, "Invalid /tmp tmpfs size.\n");
+				exit(1);
+			}
+			minijail_mount_tmp_size(j, size);
 			break;
 		case 'v':
 			minijail_namespace_vfs(j);
@@ -403,6 +413,9 @@ static int parse_args(struct minijail *j, int argc, char *argv[],
 						"'dynamic'.\n");
 				exit(1);
 			}
+			break;
+		case 'w':
+			minijail_new_session_keyring(j);
 			break;
 		case 'Y':
 			minijail_set_seccomp_filter_tsync(j);
