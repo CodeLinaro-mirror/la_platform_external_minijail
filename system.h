@@ -38,6 +38,7 @@ extern "C" {
 #define PR_CAP_AMBIENT_CLEAR_ALL 4
 #endif
 
+int secure_noroot_set_and_locked(uint64_t mask);
 int lock_securebits(uint64_t skip_mask);
 
 unsigned int get_last_valid_cap(void);
@@ -54,7 +55,7 @@ int write_proc_file(pid_t pid, const char *content, const char *basename);
 int mkdir_p(const char *path, mode_t mode, bool isdir);
 
 int setup_mount_destination(const char *source, const char *dest, uid_t uid,
-			    uid_t gid, bool bind);
+			    uid_t gid, bool bind, unsigned long *mnt_flags);
 
 int lookup_user(const char *user, uid_t *uid, gid_t *gid);
 int lookup_group(const char *group, gid_t *gid);

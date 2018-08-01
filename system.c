@@ -17,6 +17,7 @@
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include "util.h"
@@ -43,6 +44,12 @@
 _Static_assert(SECURE_ALL_BITS == 0x55, "SECURE_ALL_BITS == 0x55.");
 #endif
 
+int secure_noroot_set_and_locked(uint64_t mask)
+{
+	return (mask & (SECBIT_NOROOT | SECBIT_NOROOT_LOCKED)) ==
+	       (SECBIT_NOROOT | SECBIT_NOROOT_LOCKED);
+}
+
 int lock_securebits(uint64_t skip_mask)
 {
 	/*
@@ -54,6 +61,7 @@ int lock_securebits(uint64_t skip_mask)
 	unsigned long securebits =
 	    (SECURE_BITS_NO_AMBIENT | SECURE_LOCKS_NO_AMBIENT) & ~skip_mask;
 	if (!securebits) {
+		warn("not locking any securebits");
 		return 0;
 	}
 	int securebits_ret = prctl(PR_SET_SECUREBITS, securebits);
@@ -221,17 +229,23 @@ int write_pid_to_path(pid_t pid, const char *path)
  */
 int mkdir_p(const char *path, mode_t mode, bool isdir)
 {
+	int rc;
 	char *dir = strdup(path);
-	if (!dir)
-		return -errno;
+	if (!dir) {
+		rc = errno;
+		pwarn("strdup(%s) failed", path);
+		return -rc;
+	}
 
 	/* Starting from the root, work our way out to the end. */
 	char *p = strchr(dir + 1, '/');
 	while (p) {
 		*p = '\0';
 		if (mkdir(dir, mode) && errno != EEXIST) {
+			rc = errno;
+			pwarn("mkdir(%s, 0%o) failed", dir, mode);
 			free(dir);
-			return -errno;
+			return -rc;
 		}
 		*p = '/';
 		p = strchr(p + 1, '/');
@@ -242,8 +256,11 @@ int mkdir_p(const char *path, mode_t mode, bool isdir)
 	 * of trailing slashes.
 	 */
 	free(dir);
-	if (isdir && mkdir(path, mode) && errno != EEXIST)
-		return -errno;
+	if (isdir && mkdir(path, mode) && errno != EEXIST) {
+		rc = errno;
+		pwarn("mkdir(%s, 0%o) failed", path, mode);
+		return -rc;
+	}
 	return 0;
 }
 
@@ -252,7 +269,7 @@ int mkdir_p(const char *path, mode_t mode, bool isdir)
  * Creates it if needed and possible.
  */
 int setup_mount_destination(const char *source, const char *dest, uid_t uid,
-			    uid_t gid, bool bind)
+			    uid_t gid, bool bind, unsigned long *mnt_flags)
 {
 	int rc;
 	struct stat st_buf;
@@ -273,8 +290,11 @@ int setup_mount_destination(const char *source, const char *dest, uid_t uid,
 	if (source[0] == '/') {
 		/* The source is an absolute path -- it better exist! */
 		rc = stat(source, &st_buf);
-		if (rc)
-			return -errno;
+		if (rc) {
+			rc = errno;
+			pwarn("stat(%s) failed", source);
+			return -rc;
+		}
 
 		/*
 		 * If bind mounting, we only create a directory if the source
@@ -290,12 +310,29 @@ int setup_mount_destination(const char *source, const char *dest, uid_t uid,
 		domkdir = S_ISDIR(st_buf.st_mode) ||
 			  (!bind && (S_ISBLK(st_buf.st_mode) ||
 				     S_ISCHR(st_buf.st_mode)));
+
+		/* If bind mounting, also grab the mount flags of the source. */
+		if (bind && mnt_flags) {
+			struct statvfs stvfs_buf;
+			rc = statvfs(source, &stvfs_buf);
+			if (rc) {
+				rc = errno;
+				pwarn(
+				    "failed to look up mount flags: source=%s",
+				    source);
+				return -rc;
+			}
+			*mnt_flags = stvfs_buf.f_flag;
+		}
 	} else {
 		/* The source is a relative path -- assume it's a pseudo fs. */
 
 		/* Disallow relative bind mounts. */
-		if (bind)
+		if (bind) {
+			warn("relative bind-mounts are not allowed: source=%s",
+			     source);
 			return -EINVAL;
+		}
 
 		domkdir = true;
 	}
@@ -307,15 +344,24 @@ int setup_mount_destination(const char *source, const char *dest, uid_t uid,
 	 * the actual mount will set those perms/ownership on the mount point
 	 * which is all people should need to access it.
 	 */
-	if (mkdir_p(dest, 0755, domkdir))
-		return -errno;
+	rc = mkdir_p(dest, 0755, domkdir);
+	if (rc)
+		return rc;
 	if (!domkdir) {
 		int fd = open(dest, O_RDWR | O_CREAT | O_CLOEXEC, 0700);
-		if (fd < 0)
-			return -errno;
+		if (fd < 0) {
+			rc = errno;
+			pwarn("open(%s) failed", dest);
+			return -rc;
+		}
 		close(fd);
 	}
-	return chown(dest, uid, gid);
+	if (chown(dest, uid, gid)) {
+		rc = errno;
+		pwarn("chown(%s, %u, %u) failed", dest, uid, gid);
+		return -rc;
+	}
+	return 0;
 }
 
 /*

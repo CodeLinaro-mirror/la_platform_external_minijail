@@ -82,6 +82,14 @@
 /* Keyctl commands. */
 #define KEYCTL_JOIN_SESSION_KEYRING 1
 
+/*
+ * The userspace equivalent of MNT_USER_SETTABLE_MASK, which is the mask of all
+ * flags that can be modified by MS_REMOUNT.
+ */
+#define MS_USER_SETTABLE_MASK                                                  \
+	(MS_NOSUID | MS_NODEV | MS_NOEXEC | MS_NOATIME | MS_NODIRATIME |       \
+	 MS_RELATIME | MS_RDONLY)
+
 struct minijail_rlimit {
 	int type;
 	rlim_t cur;
@@ -150,6 +158,7 @@ struct minijail {
 		int cgroups : 1;
 		int alt_syscall : 1;
 		int reset_signal_mask : 1;
+		int reset_signal_handlers : 1;
 		int close_open_fds : 1;
 		int new_session_keyring : 1;
 		int forward_signals : 1;
@@ -413,6 +422,11 @@ void API minijail_set_ambient_caps(struct minijail *j)
 void API minijail_reset_signal_mask(struct minijail *j)
 {
 	j->flags.reset_signal_mask = 1;
+}
+
+void API minijail_reset_signal_handlers(struct minijail *j)
+{
+	j->flags.reset_signal_handlers = 1;
 }
 
 void API minijail_namespace_vfs(struct minijail *j)
@@ -882,7 +896,7 @@ void API minijail_parse_seccomp_filters(struct minijail *j, const char *path)
 	if (!seccomp_should_parse_filters(j))
 		return;
 
-	FILE *file = fopen(path, "r");
+	FILE *file = fopen(path, "re");
 	if (!file) {
 		pdie("failed to open seccomp filter file '%s'", path);
 	}
@@ -1360,7 +1374,8 @@ static int mount_one(const struct minijail *j, struct mountpoint *m,
 {
 	int ret;
 	char *dest;
-	int remount_ro = 0;
+	int remount = 0;
+	unsigned long original_mnt_flags = 0;
 
 	/* We assume |dest| has a leading "/". */
 	if (dev_path && strncmp("/dev/", m->dest, 5) == 0) {
@@ -1372,35 +1387,44 @@ static int mount_one(const struct minijail *j, struct mountpoint *m,
 			return -ENOMEM;
 	}
 
-	ret = setup_mount_destination(m->src, dest, j->uid, j->gid,
-				      (m->flags & MS_BIND));
+	ret =
+	    setup_mount_destination(m->src, dest, j->uid, j->gid,
+				    (m->flags & MS_BIND), &original_mnt_flags);
 	if (ret) {
-		pwarn("creating mount target '%s' failed", dest);
+		warn("creating mount target '%s' failed", dest);
 		goto error;
 	}
 
 	/*
-	 * R/O bind mounts have to be remounted since 'bind' and 'ro'
-	 * can't both be specified in the original bind mount.
-	 * Remount R/O after the initial mount.
+	 * Bind mounts that change the 'ro' flag have to be remounted since
+	 * 'bind' and other flags can't both be specified in the same command.
+	 * Remount after the initial mount.
 	 */
-	if ((m->flags & MS_BIND) && (m->flags & MS_RDONLY)) {
-		remount_ro = 1;
-		m->flags &= ~MS_RDONLY;
+	if ((m->flags & MS_BIND) &&
+	    ((m->flags & MS_RDONLY) != (original_mnt_flags & MS_RDONLY))) {
+		remount = 1;
+		/*
+		 * Restrict the mount flags to those that are user-settable in a
+		 * MS_REMOUNT request, but excluding MS_RDONLY. The
+		 * user-requested mount flags will dictate whether the remount
+		 * will have that flag or not.
+		 */
+		original_mnt_flags &= (MS_USER_SETTABLE_MASK & ~MS_RDONLY);
 	}
 
 	ret = mount(m->src, dest, m->type, m->flags, m->data);
 	if (ret) {
-		pwarn("mount: %s -> %s", m->src, dest);
+		pwarn("bind: %s -> %s flags=%#lx", m->src, dest, m->flags);
 		goto error;
 	}
 
-	if (remount_ro) {
-		m->flags |= MS_RDONLY;
-		ret = mount(m->src, dest, NULL,
-			    m->flags | MS_REMOUNT, m->data);
+	if (remount) {
+		ret =
+		    mount(m->src, dest, NULL,
+			  m->flags | original_mnt_flags | MS_REMOUNT, m->data);
 		if (ret) {
-			pwarn("bind ro: %s -> %s", m->src, dest);
+			pwarn("bind remount: %s -> %s flags=%#lx", m->src, dest,
+			      m->flags | original_mnt_flags | MS_REMOUNT);
 			goto error;
 		}
 	}
@@ -1730,12 +1754,28 @@ static void drop_caps(const struct minijail *j, unsigned int last_valid_cap)
 		die("can't apply initial cleaned capset");
 
 	/*
-	 * Instead of dropping bounding set first, do it here in case
+	 * Instead of dropping the bounding set first, do it here in case
 	 * the caller had a more permissive bounding set which could
 	 * have been used above to raise a capability that wasn't already
 	 * present. This requires CAP_SETPCAP, so we raised/kept it above.
+	 *
+	 * However, if we're asked to skip setting *and* locking the
+	 * SECURE_NOROOT securebit, also skip dropping the bounding set.
+	 * If the caller wants to regain all capabilities when executing a
+	 * set-user-ID-root program, allow them to do so. The default behavior
+	 * (i.e. the behavior without |securebits_skip_mask| set) will still put
+	 * the jailed process tree in a capabilities-only environment.
+	 *
+	 * We check the negated skip mask for SECURE_NOROOT and
+	 * SECURE_NOROOT_LOCKED. If the bits are set in the negated mask they
+	 * will *not* be skipped in lock_securebits(), and therefore we should
+	 * drop the bounding set.
 	 */
-	drop_capbset(j->caps, last_valid_cap);
+	if (secure_noroot_set_and_locked(~j->securebits_skip_mask)) {
+		drop_capbset(j->caps, last_valid_cap);
+	} else {
+		warn("SECURE_NOROOT not set, not dropping bounding set");
+	}
 
 	/* If CAP_SETPCAP wasn't specifically requested, now we remove it. */
 	if ((j->caps & (one << CAP_SETPCAP)) == 0) {
@@ -1848,12 +1888,12 @@ static void set_seccomp_filter(const struct minijail *j)
 
 static pid_t forward_pid = -1;
 
-static void forward_signal(__attribute__((unused)) int nr,
-			   __attribute__((unused)) siginfo_t *siginfo,
-			   __attribute__((unused)) void *void_context)
+static void forward_signal(int sig,
+			   siginfo_t *siginfo attribute_unused,
+			   void *void_context attribute_unused)
 {
 	if (forward_pid != -1) {
-		kill(forward_pid, nr);
+		kill(forward_pid, sig);
 	}
 }
 
@@ -1866,19 +1906,19 @@ static void install_signal_handlers(void)
 	act.sa_flags = SA_SIGINFO | SA_RESTART;
 
 	/* Handle all signals, except SIGCHLD. */
-	for (int nr = 1; nr < NSIG; nr++) {
+	for (int sig = 1; sig < NSIG; sig++) {
 		/*
 		 * We don't care if we get EINVAL: that just means that we
 		 * can't handle this signal, so let's skip it and continue.
 		 */
-		sigaction(nr, &act, NULL);
+		sigaction(sig, &act, NULL);
 	}
 	/* Reset SIGCHLD's handler. */
 	signal(SIGCHLD, SIG_DFL);
 
 	/* Handle real-time signals. */
-	for (int nr = SIGRTMIN; nr <= SIGRTMAX; nr++) {
-		sigaction(nr, &act, NULL);
+	for (int sig = SIGRTMIN; sig <= SIGRTMAX; sig++) {
+		sigaction(sig, &act, NULL);
 	}
 }
 
@@ -2078,7 +2118,7 @@ void API minijail_enter(const struct minijail *j)
 /* TODO(wad): will visibility affect this variable? */
 static int init_exitstatus = 0;
 
-void init_term(int __attribute__ ((unused)) sig)
+void init_term(int sig attribute_unused)
 {
 	_exit(init_exitstatus);
 }
@@ -2635,6 +2675,21 @@ static int minijail_run_internal(struct minijail *j,
 			pdie("sigemptyset failed");
 		if (sigprocmask(SIG_SETMASK, &signal_mask, NULL) != 0)
 			pdie("sigprocmask failed");
+	}
+
+	if (j->flags.reset_signal_handlers) {
+		int signum;
+		for (signum = 0; signum <= SIGRTMAX; signum++) {
+			/*
+			 * Ignore EINVAL since some signal numbers in the range
+			 * might not be valid.
+			 */
+			if (signal(signum, SIG_DFL) == SIG_ERR &&
+			    errno != EINVAL) {
+				pdie("failed to reset signal %d disposition",
+				     signum);
+			}
+		}
 	}
 
 	if (j->flags.close_open_fds) {

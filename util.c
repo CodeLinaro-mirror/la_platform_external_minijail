@@ -34,27 +34,28 @@
 #if defined(__ANDROID__)
 const char *log_syscalls[] = {"socket", "connect", "fcntl", "writev"};
 #else
-const char *log_syscalls[] = {"socket", "connect", "sendto"};
+const char *log_syscalls[] = {"socket", "connect", "sendto", "writev"};
 #endif
 #elif defined(__i386__)
 #if defined(__ANDROID__)
 const char *log_syscalls[] = {"socketcall", "writev", "fcntl64",
 			      "clock_gettime"};
 #else
-const char *log_syscalls[] = {"socketcall", "time"};
+const char *log_syscalls[] = {"socketcall", "time", "writev"};
 #endif
 #elif defined(__arm__)
 #if defined(__ANDROID__)
 const char *log_syscalls[] = {"clock_gettime", "connect", "fcntl64", "socket",
 			      "writev"};
 #else
-const char *log_syscalls[] = {"socket", "connect", "gettimeofday", "send"};
+const char *log_syscalls[] = {"socket", "connect", "gettimeofday", "send",
+			      "writev"};
 #endif
 #elif defined(__aarch64__)
 #if defined(__ANDROID__)
 const char *log_syscalls[] = {"connect", "fcntl", "sendto", "socket", "writev"};
 #else
-const char *log_syscalls[] = {"socket", "connect", "send"};
+const char *log_syscalls[] = {"socket", "connect", "send", "writev"};
 #endif
 #elif defined(__powerpc__) || defined(__ia64__) || defined(__hppa__) ||        \
       defined(__sparc__) || defined(__mips__)
@@ -79,6 +80,51 @@ static struct logging_config_t {
 	.logger = LOG_TO_SYSLOG,
 };
 /* clang-format on */
+
+#if defined(USE_EXIT_ON_DIE)
+#define do_abort() exit(1)
+#else
+#define do_abort() abort()
+#endif
+
+#if defined(__clang__)
+#define attribute_no_optimize __attribute__((optnone))
+#else
+#define attribute_no_optimize __attribute__((__optimize__(0)))
+#endif
+
+/* Forces the compiler to perform no optimizations on |var|. */
+static void attribute_no_optimize alias(const void *var)
+{
+	(void)var;
+}
+
+void do_fatal_log(int priority, const char *format, ...)
+{
+	va_list args, stack_args;
+	va_start(args, format);
+	va_copy(stack_args, args);
+	if (logging_config.logger == LOG_TO_SYSLOG) {
+		vsyslog(priority, format, args);
+	} else {
+		vdprintf(logging_config.fd, format, args);
+		dprintf(logging_config.fd, "\n");
+	}
+	va_end(args);
+
+	/*
+	 * Write another copy of the first few characters of the message into a
+	 * stack-based buffer so that it can appear in minidumps. Choosing a
+	 * small-ish buffer size since breakpad will only pick up the first few
+	 * kilobytes of each stack, so that will prevent this buffer from
+	 * kicking out other stack frames.
+	 */
+	char log_line[512];
+	vsnprintf(log_line, sizeof(log_line), format, stack_args);
+	va_end(stack_args);
+	alias(log_line);
+	do_abort();
+}
 
 void do_log(int priority, const char *format, ...)
 {
