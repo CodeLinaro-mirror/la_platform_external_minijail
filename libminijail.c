@@ -1841,8 +1841,8 @@ static void set_seccomp_filter(const struct minijail *j)
 	 * build time, so this cannot be used by an attacker to skip setting
 	 * seccomp filter.
 	 */
-	if (j->flags.seccomp_filter && running_with_asan()) {
-		warn("running with ASan, not setting seccomp filter");
+	if (j->flags.seccomp_filter && running_with_asan_or_hwasan()) {
+		warn("running with (HW)ASan, not setting seccomp filter");
 		return;
 	}
 
@@ -2056,15 +2056,22 @@ void API minijail_enter(const struct minijail *j)
 		drop_capbset(j->cap_bset, last_valid_cap);
 	}
 
+	/*
+	 * POSIX capabilities are a bit tricky. If we drop our capability to
+	 * change uids, our attempt to use drop_ugid() below will fail. Hang on
+	 * to root caps across drop_ugid(), then lock securebits.
+	 */
 	if (j->flags.use_caps) {
 		/*
-		 * POSIX capabilities are a bit tricky. If we drop our
-		 * capability to change uids, our attempt to use setuid()
-		 * below will fail. Hang on to root caps across setuid(), then
-		 * lock securebits.
+		 * Using ambient capabilities takes care of most of the cases
+		 * where PR_SET_KEEPCAPS would be needed, but still try to set
+		 * them unless it is locked (maybe due to running minijail
+		 * within an already-minijailed process).
 		 */
-		if (prctl(PR_SET_KEEPCAPS, 1))
-			pdie("prctl(PR_SET_KEEPCAPS) failed");
+		if (!j->flags.set_ambient_caps || !secure_keep_caps_locked()) {
+			if (prctl(PR_SET_KEEPCAPS, 1))
+				pdie("prctl(PR_SET_KEEPCAPS) failed");
+		}
 
 		if (lock_securebits(j->securebits_skip_mask) < 0) {
 			pdie("locking securebits failed");
