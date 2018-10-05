@@ -726,15 +726,32 @@ int API minijail_mount_with_data(struct minijail *j, const char *src,
 	m->type = strdup(type);
 	if (!m->type)
 		goto error;
+
+	if (!data || !data[0]) {
+		/*
+		 * Set up secure defaults for certain filesystems.  Adding this
+		 * fs-specific logic here kind of sucks, but considering how
+		 * people use these in practice, it's probably OK.  If they want
+		 * the kernel defaults, they can pass data="" instead of NULL.
+		 */
+		if (!strcmp(type, "tmpfs")) {
+			/* tmpfs defaults to mode=1777 and size=50%. */
+			data = "mode=0755,size=10M";
+		}
+	}
 	if (data) {
 		m->data = strdup(data);
 		if (!m->data)
 			goto error;
 		m->has_data = 1;
 	}
+
+	/* If they don't specify any flags, default to secure ones. */
+	if (flags == 0)
+		flags = MS_NODEV | MS_NOEXEC | MS_NOSUID;
 	m->flags = flags;
 
-	info("mount %s -> %s type '%s'", src, dest, type);
+	info("mount '%s' -> '%s' type '%s' flags %#lx", src, dest, type, flags);
 
 	/*
 	 * Force vfs namespacing so the mounts don't leak out into the
@@ -1841,7 +1858,7 @@ static void set_seccomp_filter(const struct minijail *j)
 	 * build time, so this cannot be used by an attacker to skip setting
 	 * seccomp filter.
 	 */
-	if (j->flags.seccomp_filter && running_with_asan_or_hwasan()) {
+	if (j->flags.seccomp_filter && running_with_asan()) {
 		warn("running with (HW)ASan, not setting seccomp filter");
 		return;
 	}
@@ -1863,7 +1880,6 @@ static void set_seccomp_filter(const struct minijail *j)
 			 */
 			if (signal(SIGSYS, SIG_DFL) == SIG_ERR)
 				pdie("failed to reset SIGSYS disposition");
-			info("reset SIGSYS disposition");
 		}
 	}
 
