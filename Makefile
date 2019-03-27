@@ -7,12 +7,12 @@ include common.mk
 
 LIBDIR ?= /lib
 PRELOADNAME = libminijailpreload.so
-PRELOADPATH = \"$(LIBDIR)/$(PRELOADNAME)\"
-CPPFLAGS += -DPRELOADPATH="$(PRELOADPATH)"
+PRELOADPATH = "$(LIBDIR)/$(PRELOADNAME)"
+CPPFLAGS += -DPRELOADPATH='$(PRELOADPATH)'
 
-ifneq ($(HAVE_SECUREBITS_H),no)
-CPPFLAGS += -DHAVE_SECUREBITS_H
-endif
+# Defines the pivot root path used by the minimalistic-mountns profile.
+DEFAULT_PIVOT_ROOT ?= /var/empty
+CPPFLAGS += -DDEFAULT_PIVOT_ROOT='"$(DEFAULT_PIVOT_ROOT)"'
 
 ifeq ($(USE_seccomp),no)
 CPPFLAGS += -DUSE_SECCOMP_SOFTFAIL
