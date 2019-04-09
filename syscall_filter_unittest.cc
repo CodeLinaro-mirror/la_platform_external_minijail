@@ -1201,7 +1201,7 @@ TEST_F(FileTest, seccomp_read) {
 
   const int LABEL_ID = 0;
 
-    FILE* policy_file = write_policy_to_pipe(policy);
+  FILE* policy_file = write_policy_to_pipe(policy);
   ASSERT_NE(policy_file, nullptr);
   int res = test_compile_file("policy", policy_file, head_, &arg_blocks_,
                               &labels_);
@@ -1744,6 +1744,25 @@ TEST(FilterTest, include_same_syscalls) {
   free(actual.filter);
 }
 
+TEST(FilterTest, include_two) {
+  struct sock_fprog actual;
+  std::string policy =
+      "@include " + source_path("test/seccomp.policy") + "\n" +
+      "@include " + source_path("test/seccomp.policy") + "\n";
+
+  FILE* policy_file = write_policy_to_pipe(policy);
+  ASSERT_NE(policy_file, nullptr);
+
+  int res = test_compile_filter("policy", policy_file, &actual);
+  fclose(policy_file);
+
+  ASSERT_EQ(res, 0);
+  EXPECT_EQ(actual.len,
+            ARCH_VALIDATION_LEN + 1 /* load syscall nr */ +
+                2 * 8 /* check syscalls twice */ + 1 /* filter return */);
+  free(actual.filter);
+}
+
 TEST(FilterTest, include_invalid_policy) {
   struct sock_fprog actual;
   std::string policy =
@@ -1786,6 +1805,8 @@ TEST(FilterTest, include_nested) {
   ASSERT_NE(res, 0);
 }
 
+#endif  // !__ANDROID__
+
 TEST(FilterTest, error_cleanup_leak) {
   struct sock_fprog actual;
   std::string policy =
@@ -1802,5 +1823,3 @@ TEST(FilterTest, error_cleanup_leak) {
    */
   ASSERT_EQ(res, -1);
 }
-
-#endif  // !__ANDROID__
