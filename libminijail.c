@@ -1794,14 +1794,17 @@ static void write_ugid_maps_or_die(const struct minijail *j)
 	if (j->uidmap && write_proc_file(j->initpid, j->uidmap, "uid_map") != 0)
 		kill_child_and_die(j, "failed to write uid_map");
 	if (j->gidmap && j->flags.disable_setgroups) {
-		/* Older kernels might not have the /proc/<pid>/setgroups files. */
+		/*
+		 * Older kernels might not have the /proc/<pid>/setgroups files.
+		 */
 		int ret = write_proc_file(j->initpid, "deny", "setgroups");
 		if (ret != 0) {
 			if (ret == -ENOENT) {
 				/* See http://man7.org/linux/man-pages/man7/user_namespaces.7.html. */
 				warn("could not disable setgroups(2)");
 			} else
-				kill_child_and_die(j, "failed to disable setgroups(2)");
+				kill_child_and_die(
+				    j, "failed to disable setgroups(2)");
 		}
 	}
 	if (j->gidmap && write_proc_file(j->initpid, j->gidmap, "gid_map") != 0)
@@ -2161,12 +2164,15 @@ void API minijail_enter(const struct minijail *j)
 			pdie("unshare(CLONE_NEWNS) failed");
 		/*
 		 * By default, remount all filesystems as private, unless
-		 * - Passed a specific remount mode, in which case remount with that,
-		 * - Asked not to remount at all, in which case skip the mount(2) call.
+		 * - Passed a specific remount mode, in which case remount with
+		 *   that,
+		 * - Asked not to remount at all, in which case skip the
+		 *   mount(2) call.
 		 * https://www.kernel.org/doc/Documentation/filesystems/sharedsubtree.txt
 		 */
 		if (j->remount_mode) {
-			if (mount(NULL, "/", NULL, MS_REC | j->remount_mode, NULL))
+			if (mount(NULL, "/", NULL, MS_REC | j->remount_mode,
+				  NULL))
 				pdie("mount(NULL, /, NULL, MS_REC | MS_PRIVATE,"
 				     " NULL) failed");
 		}
@@ -2802,7 +2808,11 @@ static int minijail_run_internal(struct minijail *j,
 		if (use_preload) {
 			free(oldenv_copy);
 		}
-		die("failed to fork child");
+		if (pid_namespace && errno == EPERM) {
+			warn("clone(CLONE_NEWPID) failed with EPERM, maybe "
+			     "this process is not running with CAP_SYS_ADMIN?");
+		}
+		pdie("failed to fork child");
 	}
 
 	if (child_pid) {
@@ -2979,8 +2989,8 @@ static int minijail_run_internal(struct minijail *j,
 	 * set up the read end of the pipe.
 	 */
 	if (status_out->pstdin_fd) {
-		if (setup_and_dupe_pipe_end(stdin_fds, 0 /* read end */,
-					    STDIN_FILENO) < 0)
+		if (dupe_and_close_fd(stdin_fds, 0 /* read end */,
+                          STDIN_FILENO) < 0)
 			die("failed to set up stdin pipe");
 	}
 
@@ -2989,8 +2999,8 @@ static int minijail_run_internal(struct minijail *j,
 	 * set up the write end of the pipe.
 	 */
 	if (status_out->pstdout_fd) {
-		if (setup_and_dupe_pipe_end(stdout_fds, 1 /* write end */,
-					    STDOUT_FILENO) < 0)
+		if (dupe_and_close_fd(stdout_fds, 1 /* write end */,
+                          STDOUT_FILENO) < 0)
 			die("failed to set up stdout pipe");
 	}
 
@@ -2999,8 +3009,8 @@ static int minijail_run_internal(struct minijail *j,
 	 * set up the write end of the pipe.
 	 */
 	if (status_out->pstderr_fd) {
-		if (setup_and_dupe_pipe_end(stderr_fds, 1 /* write end */,
-					    STDERR_FILENO) < 0)
+		if (dupe_and_close_fd(stderr_fds, 1 /* write end */,
+                          STDERR_FILENO) < 0)
 			die("failed to set up stderr pipe");
 	}
 
@@ -3092,28 +3102,37 @@ static int minijail_run_internal(struct minijail *j,
 	 *   -> init()-ing process
 	 *      -> execve()-ing process
 	 */
-	ret = execve(config->filename, config->argv, child_env);
-	if (ret == -1) {
-		pwarn("execve(%s) failed", config->filename);
-	}
+	execve(config->filename, config->argv, child_env);
+
+	ret = (errno == ENOENT ? MINIJAIL_ERR_NO_COMMAND : MINIJAIL_ERR_NO_ACCESS);
+	pwarn("execve(%s) failed", config->filename);
 	_exit(ret);
 }
 
 int API minijail_kill(struct minijail *j)
 {
-	int st;
+	if (j->initpid <= 0)
+		return -ECHILD;
+
 	if (kill(j->initpid, SIGTERM))
 		return -errno;
-	if (waitpid(j->initpid, &st, 0) < 0)
-		return -errno;
-	return st;
+
+	return minijail_wait(j);
 }
 
 int API minijail_wait(struct minijail *j)
 {
+	if (j->initpid <= 0)
+		return -ECHILD;
+
 	int st;
-	if (waitpid(j->initpid, &st, 0) < 0)
-		return -errno;
+	while (true) {
+		const int ret = waitpid(j->initpid, &st, 0);
+		if (ret >= 0)
+			break;
+		if (errno != EINTR)
+			return -errno;
+	}
 
 	if (!WIFEXITED(st)) {
 		int error_status = st;
@@ -3131,7 +3150,7 @@ int API minijail_wait(struct minijail *j)
 			if (signum == SIGSYS) {
 				error_status = MINIJAIL_ERR_JAIL;
 			} else {
-				error_status = 128 + signum;
+				error_status = MINIJAIL_ERR_SIG_BASE + signum;
 			}
 		}
 		return error_status;
