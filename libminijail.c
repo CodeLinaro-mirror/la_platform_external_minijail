@@ -313,7 +313,9 @@ void minijail_preexec(struct minijail *j)
 struct minijail API *minijail_new(void)
 {
 	struct minijail *j = calloc(1, sizeof(struct minijail));
-	j->remount_mode = MS_PRIVATE;
+	if (j) {
+		j->remount_mode = MS_PRIVATE;
+	}
 	return j;
 }
 
@@ -722,11 +724,6 @@ char API *minijail_get_original_path(struct minijail *j,
 	return strdup(path_inside_chroot);
 }
 
-size_t minijail_get_tmpfs_size(const struct minijail *j)
-{
-	return j->tmpfs_size;
-}
-
 void API minijail_mount_dev(struct minijail *j)
 {
 	j->flags.mount_dev = 1;
@@ -1048,10 +1045,15 @@ static int parse_seccomp_filters(struct minijail *j, const char *filename,
 		else
 			filteropts.action = ACTION_RET_TRAP;
 	} else {
-		if (j->flags.seccomp_filter_tsync)
-			filteropts.action = ACTION_RET_TRAP;
-		else
+		if (j->flags.seccomp_filter_tsync) {
+			if (seccomp_ret_kill_process_available()) {
+				filteropts.action = ACTION_RET_KILL_PROCESS;
+			} else {
+				filteropts.action = ACTION_RET_TRAP;
+			}
+		} else {
 			filteropts.action = ACTION_RET_KILL;
+		}
 	}
 
 	/*
@@ -1060,6 +1062,9 @@ static int parse_seccomp_filters(struct minijail *j, const char *filename,
 	 */
 	filteropts.allow_syscalls_for_logging =
 	    filteropts.allow_logging && !seccomp_ret_log_available();
+
+	/* Whether to fail on duplicate syscalls. */
+	filteropts.allow_duplicate_syscalls = allow_duplicate_syscalls();
 
 	if (compile_filter(filename, policy_file, fprog, &filteropts)) {
 		free(fprog);
@@ -1150,15 +1155,16 @@ struct marshal_state {
 	char *buf;
 };
 
-void marshal_state_init(struct marshal_state *state, char *buf,
-			size_t available)
+static void marshal_state_init(struct marshal_state *state, char *buf,
+			       size_t available)
 {
 	state->available = available;
 	state->buf = buf;
 	state->total = 0;
 }
 
-void marshal_append(struct marshal_state *state, void *src, size_t length)
+static void marshal_append(struct marshal_state *state, const void *src,
+			   size_t length)
 {
 	size_t copy_len = MIN(state->available, length);
 
@@ -1172,7 +1178,13 @@ void marshal_append(struct marshal_state *state, void *src, size_t length)
 	state->total += length;
 }
 
-void marshal_mount(struct marshal_state *state, const struct mountpoint *m)
+static void marshal_append_string(struct marshal_state *state, const char *src)
+{
+	marshal_append(state, src, strlen(src) + 1);
+}
+
+static void marshal_mount(struct marshal_state *state,
+			  const struct mountpoint *m)
 {
 	marshal_append(state, m->src, strlen(m->src) + 1);
 	marshal_append(state, m->dest, strlen(m->dest) + 1);
@@ -1183,23 +1195,23 @@ void marshal_mount(struct marshal_state *state, const struct mountpoint *m)
 	marshal_append(state, (char *)&m->flags, sizeof(m->flags));
 }
 
-void minijail_marshal_helper(struct marshal_state *state,
-			     const struct minijail *j)
+static void minijail_marshal_helper(struct marshal_state *state,
+				    const struct minijail *j)
 {
 	struct mountpoint *m = NULL;
 	size_t i;
 
 	marshal_append(state, (char *)j, sizeof(*j));
 	if (j->user)
-		marshal_append(state, j->user, strlen(j->user) + 1);
+		marshal_append_string(state, j->user);
 	if (j->suppl_gid_list) {
 		marshal_append(state, j->suppl_gid_list,
 			       j->suppl_gid_count * sizeof(gid_t));
 	}
 	if (j->chrootdir)
-		marshal_append(state, j->chrootdir, strlen(j->chrootdir) + 1);
+		marshal_append_string(state, j->chrootdir);
 	if (j->hostname)
-		marshal_append(state, j->hostname, strlen(j->hostname) + 1);
+		marshal_append_string(state, j->hostname);
 	if (j->alt_syscall_table) {
 		marshal_append(state, j->alt_syscall_table,
 			       strlen(j->alt_syscall_table) + 1);
@@ -1213,7 +1225,7 @@ void minijail_marshal_helper(struct marshal_state *state,
 		marshal_mount(state, m);
 	}
 	for (i = 0; i < j->cgroup_count; ++i)
-		marshal_append(state, j->cgroups[i], strlen(j->cgroups[i]) + 1);
+		marshal_append_string(state, j->cgroups[i]);
 }
 
 size_t API minijail_size(const struct minijail *j)
@@ -2209,8 +2221,8 @@ void API minijail_enter(const struct minijail *j)
 		if (j->remount_mode) {
 			if (mount(NULL, "/", NULL, MS_REC | j->remount_mode,
 				  NULL))
-				pdie("mount(NULL, /, NULL, MS_REC | MS_PRIVATE,"
-				     " NULL) failed");
+				pdie("mount(NULL, /, NULL, "
+				     "MS_REC | j->remount_mode, NULL) failed");
 		}
 	}
 
@@ -2334,12 +2346,12 @@ void API minijail_enter(const struct minijail *j)
 /* TODO(wad): will visibility affect this variable? */
 static int init_exitstatus = 0;
 
-void init_term(int sig attribute_unused)
+static void init_term(int sig attribute_unused)
 {
 	_exit(init_exitstatus);
 }
 
-void init(pid_t rootpid)
+static void init(pid_t rootpid)
 {
 	pid_t pid;
 	int status;
