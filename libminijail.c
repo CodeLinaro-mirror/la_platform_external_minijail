@@ -67,6 +67,10 @@
 #ifndef SECCOMP_FILTER_FLAG_TSYNC
 # define SECCOMP_FILTER_FLAG_TSYNC 1
 #endif
+
+#ifndef SECCOMP_FILTER_FLAG_SPEC_ALLOW
+# define SECCOMP_FILTER_FLAG_SPEC_ALLOW (1 << 2)
+#endif
 /* End seccomp filter related flags. */
 
 /* New cgroup namespace might not be in linux-headers yet. */
@@ -149,6 +153,7 @@ struct minijail {
 		int seccomp_filter : 1;
 		int seccomp_filter_tsync : 1;
 		int seccomp_filter_logging : 1;
+		int seccomp_filter_allow_speculation : 1;
 		int chroot : 1;
 		int pivot_root : 1;
 		int mount_dev : 1;
@@ -427,6 +432,16 @@ void API minijail_set_seccomp_filter_tsync(struct minijail *j)
 	}
 
 	j->flags.seccomp_filter_tsync = 1;
+}
+
+void API minijail_set_seccomp_filter_allow_speculation(struct minijail *j)
+{
+	if (j->filter_len > 0 && j->filter_prog != NULL) {
+		die("minijail_set_seccomp_filter_allow_speculation() must be "
+		    "called before minijail_parse_seccomp_filters()");
+	}
+
+	j->flags.seccomp_filter_allow_speculation = 1;
 }
 
 void API minijail_log_seccomp_filter_failures(struct minijail *j)
@@ -933,6 +948,7 @@ static void clear_seccomp_options(struct minijail *j)
 	j->flags.seccomp_filter = 0;
 	j->flags.seccomp_filter_tsync = 0;
 	j->flags.seccomp_filter_logging = 0;
+	j->flags.seccomp_filter_allow_speculation = 0;
 	j->filter_len = 0;
 	j->filter_prog = NULL;
 	j->flags.no_new_privs = 0;
@@ -981,6 +997,16 @@ static int seccomp_should_use_filters(struct minijail *j)
 			 * we can proceed. Worst case scenario minijail_enter()
 			 * will abort() if seccomp or TSYNC fail.
 			 */
+		}
+	}
+	if (j->flags.seccomp_filter_allow_speculation) {
+		/* Is the SPEC_ALLOW flag supported? */
+		if (sys_seccomp(SECCOMP_SET_MODE_FILTER,
+				SECCOMP_FILTER_FLAG_SPEC_ALLOW, NULL) == -1 &&
+		    errno == EINVAL) {
+			warn("allowing speculative execution on seccomp "
+			     "processes not supported");
+			j->flags.seccomp_filter_allow_speculation = 0;
 		}
 	}
 	return 1;
@@ -1784,19 +1810,37 @@ static int remount_proc_readonly(const struct minijail *j)
 	 * mutate our parent's mount as well, even though we're in a VFS
 	 * namespace (!). Instead, remove their mount from our namespace lazily
 	 * (MNT_DETACH) and make our own.
+	 *
+	 * However, we skip this in the user namespace case because it will
+	 * invariably fail. Every mount namespace is "owned" by the
+	 * user namespace of the process that creates it. Mount namespace A is
+	 * "less privileged" than mount namespace B if A is created off of B,
+	 * and B is owned by a different user namespace.
+	 * When a less privileged mount namespace is created, the mounts used to
+	 * initialize it (coming from the more privileged mount namespace) come
+	 * as a unit, and are locked together. This means that code running in
+	 * the new mount (and user) namespace cannot piecemeal unmount
+	 * individual mounts inherited from a more privileged mount namespace.
+	 * See https://man7.org/linux/man-pages/man7/mount_namespaces.7.html,
+	 * "Restrictions on mount namespaces" for details.
+	 *
+	 * This happens in our use case because we first enter a new user
+	 * namespace (on clone(2)) and then we unshare(2) a new mount namespace,
+	 * which means the new mount namespace is less privileged than its
+	 * parent mount namespace. This would also happen if we entered a new
+	 * mount namespace on clone(2), since the user namespace is created
+	 * first.
+	 * In all other non-user-namespace cases the new mount namespace is
+	 * similarly privileged as the parent mount namespace so unmounting a
+	 * single mount is allowed.
+	 *
+	 * We still remount /proc as read-only in the user namespace case
+	 * because while a process with CAP_SYS_ADMIN in the new user namespace
+	 * can unmount the RO mount and get at the RW mount, an attacker with
+	 * access only to a write primitive will not be able to modify /proc.
 	 */
-	if (umount2(kProcPath, MNT_DETACH)) {
-		/*
-		 * If we are in a new user namespace, umount(2) will fail.
-		 * See http://man7.org/linux/man-pages/man7/user_namespaces.7.html
-		 */
-		if (j->flags.userns) {
-			info("umount(/proc, MNT_DETACH) failed, "
-			     "this is expected when using user namespaces");
-		} else {
-			return -errno;
-		}
-	}
+	if (!j->flags.userns && umount2(kProcPath, MNT_DETACH))
+		return -errno;
 	if (mount("proc", kProcPath, "proc", kSafeFlags | MS_RDONLY, ""))
 		return -errno;
 	return 0;
@@ -2089,9 +2133,16 @@ static void set_seccomp_filter(const struct minijail *j)
 	 * Install the syscall filter.
 	 */
 	if (j->flags.seccomp_filter) {
-		if (j->flags.seccomp_filter_tsync) {
-			if (sys_seccomp(SECCOMP_SET_MODE_FILTER,
-					SECCOMP_FILTER_FLAG_TSYNC,
+		if (j->flags.seccomp_filter_tsync ||
+		    j->flags.seccomp_filter_allow_speculation) {
+			int filter_flags =
+			    (j->flags.seccomp_filter_tsync
+				 ? SECCOMP_FILTER_FLAG_TSYNC
+				 : 0) |
+			    (j->flags.seccomp_filter_allow_speculation
+				 ? SECCOMP_FILTER_FLAG_SPEC_ALLOW
+				 : 0);
+			if (sys_seccomp(SECCOMP_SET_MODE_FILTER, filter_flags,
 					j->filter_prog)) {
 				pdie("seccomp(tsync) failed");
 			}
