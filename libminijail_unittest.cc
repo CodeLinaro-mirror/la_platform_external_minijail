@@ -61,8 +61,15 @@ std::set<pid_t> GetProcessSubtreePids(pid_t root_pid) {
       std::string path = "/proc/" + std::to_string(pid) + "/stat";
 
       FILE* f = fopen(path.c_str(), "re");
-      if (!f)
+      if (!f) {
+        if (errno == ENOENT) {
+          // This loop is inherently racy, since PIDs can be reaped in the
+          // middle of this. Not being able to find one /proc/PID/stat file is
+          // completely normal.
+          continue;
+        }
         pdie("fopen(%s)", path.c_str());
+      }
       pid_t ppid;
       int ret = fscanf(f, "%*d (%*[^)]) %*c %d", &ppid);
       fclose(f);
@@ -527,7 +534,14 @@ TEST(Test, minijail_run_env_pid_pipes) {
   EXPECT_EQ(WEXITSTATUS(status), 0);
 }
 
-TEST(Test, minijail_run_env_pid_pipes_no_preload) {
+TEST(Test, minijail_run_env_pid_pipes_with_local_preload) {
+  // TODO(crbug.com/895875): The preload library interferes with ASan since they
+  // both need to use LD_PRELOAD.
+  if (running_with_asan()) {
+    SUCCEED();
+    return;
+  }
+
   ScopedMinijail j(minijail_new());
 
   char *argv[4];
@@ -546,7 +560,7 @@ TEST(Test, minijail_run_env_pid_pipes_no_preload) {
   EXPECT_EQ(write_ret, static_cast<ssize_t>(teststr_len));
 
   char buf[kBufferSize] = {};
-  ssize_t read_ret = read(child_stdout, buf, 8);
+  ssize_t read_ret = read(child_stdout, buf, sizeof(buf) - 1);
   EXPECT_EQ(read_ret, static_cast<ssize_t>(teststr_len));
   EXPECT_STREQ(buf, teststr);
 
@@ -578,7 +592,7 @@ TEST(Test, minijail_run_env_pid_pipes_no_preload) {
   EXPECT_EQ(mj_run_ret, 0);
 
   memset(buf, 0, sizeof(buf));
-  read_ret = read(child_stderr, buf, sizeof(buf));
+  read_ret = read(child_stderr, buf, sizeof(buf) - 1);
   EXPECT_GE(read_ret, 0);
   EXPECT_STREQ(buf, "|test\n");
 
