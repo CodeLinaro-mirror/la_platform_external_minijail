@@ -283,6 +283,11 @@ impl Minijail {
             minijail_keep_supplementary_gids(self.jail);
         }
     }
+    pub fn enter(&mut self) {
+        unsafe {
+            minijail_enter(self.jail);
+        }
+    }
     // rlim_t is defined in minijail-sys to be u64 on all platforms, to avoid
     // issues on 32-bit platforms. It's also useful to us here to avoid
     // libc::rlim64_t, which is not defined at all on Android.
