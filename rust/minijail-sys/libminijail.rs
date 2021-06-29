@@ -286,9 +286,6 @@ extern "C" {
     ) -> ::std::os::raw::c_int;
 }
 extern "C" {
-    pub fn minijail_copy_jail(from: *const minijail, out: *mut minijail) -> ::std::os::raw::c_int;
-}
-extern "C" {
     pub fn minijail_add_hook(
         j: *mut minijail,
         hook: minijail_hook_t,
