@@ -10,6 +10,9 @@ PRELOADNAME = libminijailpreload.so
 PRELOADPATH = "$(LIBDIR)/$(PRELOADNAME)"
 CPPFLAGS += -DPRELOADPATH='$(PRELOADPATH)'
 
+# We don't build static libs by default.
+BUILD_STATIC_LIBS ?= no
+
 # Defines the pivot root path used by the minimalistic-mountns profile.
 DEFAULT_PIVOT_ROOT ?= /var/empty
 CPPFLAGS += -DDEFAULT_PIVOT_ROOT='"$(DEFAULT_PIVOT_ROOT)"'
@@ -68,7 +71,7 @@ UNITTEST_LIBS += $(GTEST_LIBS)
 
 CORE_OBJECT_FILES := libminijail.o syscall_filter.o signal_handler.o \
 		bpf.o util.o system.o syscall_wrapper.o \
-		libconstants.gen.o libsyscalls.gen.o
+		config_parser.o libconstants.gen.o libsyscalls.gen.o
 UNITTEST_DEPS += $(CORE_OBJECT_FILES)
 
 all: CC_BINARY(minijail0) CC_LIBRARY(libminijail.so) \
@@ -82,6 +85,7 @@ tests: TEST(CXX_BINARY(libminijail_unittest)) \
 	TEST(CXX_BINARY(syscall_filter_unittest)) \
 	TEST(CXX_BINARY(system_unittest)) \
 	TEST(CXX_BINARY(util_unittest)) \
+	TEST(CXX_BINARY(config_parser_unittest)) \
 
 
 CC_BINARY(minijail0): LDLIBS += -lcap -ldl
@@ -97,6 +101,10 @@ clean: CLEAN(libminijail.so)
 CC_STATIC_LIBRARY(libminijail.pic.a): $(CORE_OBJECT_FILES)
 CC_STATIC_LIBRARY(libminijail.pie.a): $(CORE_OBJECT_FILES)
 clean: CLEAN(libminijail.*.a)
+
+ifeq ($(BUILD_STATIC_LIBS),yes)
+all: CC_STATIC_LIBRARY(libminijail.pic.a) CC_STATIC_LIBRARY(libminijail.pie.a)
+endif
 
 CXX_BINARY(libminijail_unittest): CXXFLAGS += -Wno-write-strings \
 						$(GTEST_CXXFLAGS)
@@ -118,6 +126,11 @@ CXX_BINARY(minijail0_cli_unittest): $(UNITTEST_DEPS) minijail0_cli_unittest.o \
 		minijail0_cli.o elfparse.o
 clean: CLEAN(minijail0_cli_unittest)
 
+
+CXX_BINARY(config_parser_unittest): CXXFLAGS += $(GTEST_CXXFLAGS)
+CXX_BINARY(config_parser_unittest): LDLIBS += $(UNITTEST_LIBS)
+CXX_BINARY(config_parser_unittest): $(UNITTEST_DEPS) config_parser_unittest.o
+clean: CLEAN(config_parser_unittest)
 
 CXX_BINARY(syscall_filter_unittest): CXXFLAGS += -Wno-write-strings \
 						$(GTEST_CXXFLAGS)
