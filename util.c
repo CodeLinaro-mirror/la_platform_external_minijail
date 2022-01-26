@@ -440,16 +440,10 @@ char *tokenize(char **stringp, const char *delim)
 
 char *path_join(const char *external_path, const char *internal_path)
 {
-	char *path;
-	size_t pathlen;
-
-	/* One extra char for '/' and one for '\0', hence + 2. */
-	pathlen = strlen(external_path) + strlen(internal_path) + 2;
-	path = malloc(pathlen);
-	if (path)
-		snprintf(path, pathlen, "%s/%s", external_path, internal_path);
-
-	return path;
+	char *path = NULL;
+	return asprintf(&path, "%s/%s", external_path, internal_path) < 0
+		   ? NULL
+		   : path;
 }
 
 void *consumebytes(size_t length, char **buf, size_t *buflength)
@@ -555,4 +549,43 @@ int minijail_setenv(char ***env, const char *name, const char *value,
 	new_env[env_len] = NULL;
 	*env = new_env;
 	return 0;
+}
+
+/*
+ * This is like getline() but supports line wrapping with \.
+ */
+ssize_t getmultiline(char **lineptr, size_t *n, FILE *stream)
+{
+	ssize_t ret = getline(lineptr, n, stream);
+	if (ret < 0)
+		return ret;
+
+	char *line = *lineptr;
+	/* Eat the newline to make processing below easier. */
+	if (ret > 0 && line[ret - 1] == '\n')
+		line[--ret] = '\0';
+
+	/* If the line doesn't end in a backslash, we're done. */
+	if (ret <= 0 || line[ret - 1] != '\\')
+		return ret;
+
+	/* This line ends in a backslash. Get the nextline. */
+	line[--ret] = '\0';
+	size_t next_n = 0;
+	attribute_cleanup_str char *next_line = NULL;
+	ssize_t next_ret = getmultiline(&next_line, &next_n, stream);
+	if (next_ret == -1) {
+		/* We couldn't fully read the line, so return an error. */
+		return -1;
+	}
+
+	/* Merge the lines. */
+	*n = ret + next_ret + 2;
+	line = realloc(line, *n);
+	if (!line)
+		return -1;
+	line[ret] = ' ';
+	memcpy(&line[ret + 1], next_line, next_ret + 1);
+	*lineptr = line;
+	return *n - 1;
 }

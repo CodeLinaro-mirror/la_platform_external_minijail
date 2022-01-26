@@ -167,8 +167,10 @@ unsigned int get_last_valid_cap(void)
 			last_valid_cap--;
 		}
 	} else {
-		const char cap_file[] = "/proc/sys/kernel/cap_last_cap";
+		static const char cap_file[] = "/proc/sys/kernel/cap_last_cap";
 		FILE *fp = fopen(cap_file, "re");
+		if (!fp)
+			pdie("fopen(%s)", cap_file);
 		if (fscanf(fp, "%u", &last_valid_cap) != 1)
 			pdie("fscanf(%s)", cap_file);
 		fclose(fp);
@@ -498,11 +500,10 @@ static bool seccomp_action_is_available(const char *wanted)
 		return false;
 	}
 
-	char *actions_avail = NULL;
+	attribute_cleanup_str char *actions_avail = NULL;
 	size_t buf_size = 0;
 	if (getline(&actions_avail, &buf_size, f) < 0) {
 		pwarn("getline() failed");
-		free(actions_avail);
 		return false;
 	}
 
@@ -512,9 +513,7 @@ static bool seccomp_action_is_available(const char *wanted)
 	 * seccomp actions which include other actions though, so we're good for
 	 * now. Eventually we might want to split the string by spaces.
 	 */
-	bool available = strstr(actions_avail, wanted) != NULL;
-	free(actions_avail);
-	return available;
+	return strstr(actions_avail, wanted) != NULL;
 }
 
 int seccomp_ret_log_available(void)
