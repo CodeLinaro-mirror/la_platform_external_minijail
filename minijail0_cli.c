@@ -122,8 +122,8 @@ static void suppl_group_add(size_t *suppl_gids_count, gid_t **suppl_gids,
 	 * From here, gid is guaranteed to be set and valid,
 	 * we add it to our supplementary gids array.
 	 */
-	*suppl_gids = realloc(*suppl_gids,
-			      sizeof(gid_t) * ++(*suppl_gids_count));
+	*suppl_gids =
+	    realloc(*suppl_gids, sizeof(gid_t) * ++(*suppl_gids_count));
 	if (!suppl_gids)
 		err(1, "failed to allocate memory");
 
@@ -162,7 +162,8 @@ static void use_caps(struct minijail *j, const char *arg)
 					 */
 					continue;
 				}
-				err(1, "Could not get the value of the %d-th "
+				err(1,
+				    "Could not get the value of the %d-th "
 				    "capability",
 				    i);
 			}
@@ -206,8 +207,8 @@ static void add_rlimit(struct minijail *j, char *arg)
 	char *cur = tokenize(&arg, ",");
 	char *max = tokenize(&arg, ",");
 	char *end;
-	if (!type || type[0] == '\0' || !cur || cur[0] == '\0' ||
-	    !max || max[0] == '\0' || arg != NULL) {
+	if (!type || type[0] == '\0' || !cur || cur[0] == '\0' || !max ||
+	    max[0] == '\0' || arg != NULL) {
 		errx(1, "Bad rlimit '%s'", arg);
 	}
 	rlim_t cur_rlim;
@@ -246,8 +247,8 @@ static void add_mount(struct minijail *j, char *arg)
 	char *flags = tokenize(&arg, ",");
 	char *data = tokenize(&arg, ",");
 	char *end;
-	if (!src || src[0] == '\0' || !dest || dest[0] == '\0' ||
-	    !type || type[0] == '\0') {
+	if (!src || src[0] == '\0' || !dest || dest[0] == '\0' || !type ||
+	    type[0] == '\0') {
 		errx(1, "Bad mount: %s %s %s", src, dest, type);
 	}
 
@@ -448,6 +449,29 @@ static void read_seccomp_filter(const char *filter_path,
 	}
 }
 
+/*
+ * Long options use values starting at 0x100 so that they're out of range of
+ * bytes which is how command line options are processed.  Practically speaking,
+ * we could get by with the (7-bit) ASCII range, but UTF-8 codepoints would be a
+ * bit confusing, and honestly there's no reason to "optimize" here.
+ *
+ * The long enum values are internal to this file and can freely change at any
+ * time without breaking anything.  Don't worry about ordering.
+ */
+enum {
+	/* Everything after this point only have long options. */
+	LONG_OPTION_BASE = 0x100,
+	OPT_ADD_SUPPL_GROUP,
+	OPT_ALLOW_SPECULATIVE_EXECUTION,
+	OPT_AMBIENT,
+	OPT_CONFIG,
+	OPT_LOGGING,
+	OPT_PRELOAD_LIBRARY,
+	OPT_PROFILE,
+	OPT_SECCOMP_BPF_BINARY,
+	OPT_UTS,
+};
+
 static void usage(const char *progn)
 {
 	size_t i;
@@ -622,15 +646,16 @@ static int getopt_conf_or_cli(int argc, char *const argv[],
 	static const struct option long_options[] = {
 		{"help", no_argument, 0, 'h'},
 		{"mount-dev", no_argument, 0, 'd'},
-		{"ambient", no_argument, 0, 128},
-		{"uts", optional_argument, 0, 129},
-		{"logging", required_argument, 0, 130},
-		{"profile", required_argument, 0, 131},
-		{"preload-library", required_argument, 0, 132},
-		{"seccomp-bpf-binary", required_argument, 0, 133},
-		{"add-suppl-group", required_argument, 0, 134},
-		{"allow-speculative-execution", no_argument, 0, 135},
-		{"config", required_argument, 0, 136},
+		{"ambient", no_argument, 0, OPT_AMBIENT},
+		{"uts", optional_argument, 0, OPT_UTS},
+		{"logging", required_argument, 0, OPT_LOGGING},
+		{"profile", required_argument, 0, OPT_PROFILE},
+		{"preload-library", required_argument, 0, OPT_PRELOAD_LIBRARY},
+		{"seccomp-bpf-binary", required_argument, 0, OPT_SECCOMP_BPF_BINARY},
+		{"add-suppl-group", required_argument, 0, OPT_ADD_SUPPL_GROUP},
+		{"allow-speculative-execution", no_argument, 0,
+		 OPT_ALLOW_SPECULATIVE_EXECUTION},
+		{"config", required_argument, 0, OPT_CONFIG},
 		{"mount", required_argument, 0, 'k'},
 		{"bind-mount", required_argument, 0, 'b'},
 		{0, 0, 0, 0},
@@ -891,16 +916,16 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 			minijail_mount_dev(j);
 			break;
 		/* Long options. */
-		case 128: /* Ambient caps. */
+		case OPT_AMBIENT:
 			ambient_caps = 1;
 			minijail_set_ambient_caps(j);
 			break;
-		case 129: /* UTS/hostname namespace. */
+		case OPT_UTS:
 			minijail_namespace_uts(j);
 			if (optarg)
 				minijail_namespace_set_hostname(j, optarg);
 			break;
-		case 130: /* Logging. */
+		case OPT_LOGGING:
 			if (!strcmp(optarg, "auto"))
 				log_to_stderr = -1;
 			else if (!strcmp(optarg, "syslog"))
@@ -911,45 +936,44 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 				errx(1,
 				     "--logger must be 'syslog' or 'stderr'");
 			break;
-		case 131: /* Profile */
+		case OPT_PROFILE:
 			use_profile(j, optarg, &pivot_root, chroot, &tmp_size);
 			break;
-		case 132: /* PRELOADPATH */
+		case OPT_PRELOAD_LIBRARY:
 			*preload_path = optarg;
 			break;
-		case 133: /* seccomp-bpf binary. */
+		case OPT_SECCOMP_BPF_BINARY:
 			if (seccomp != None && seccomp != BpfBinaryFilter) {
 				errx(1, "Do not use -s, -S, or "
 					"--seccomp-bpf-binary together");
 			}
 			if (use_seccomp_log == 1)
-				errx(1, "-L does not work with --seccomp-bpf-binary");
+				errx(1, "-L does not work with "
+					"--seccomp-bpf-binary");
 			seccomp = BpfBinaryFilter;
 			minijail_use_seccomp_filter(j);
 			filter_path = optarg;
 			use_seccomp_filter_binary = 1;
 			break;
-		case 134:
-			suppl_group_add(&suppl_gids_count, &suppl_gids,
-			                optarg);
+		case OPT_ADD_SUPPL_GROUP:
+			suppl_group_add(&suppl_gids_count, &suppl_gids, optarg);
 			break;
-		case 135:
+		case OPT_ALLOW_SPECULATIVE_EXECUTION:
 			minijail_set_seccomp_filter_allow_speculation(j);
 			break;
-		case 136: {
+		case OPT_CONFIG: {
 			if (conf_entry_list != NULL) {
-				errx(1,
-					 "Nested config file specification is "
-					 "not allowed.");
+				errx(1, "Nested config file specification is "
+					"not allowed.");
 			}
 			conf_entry_list = new_config_entry_list();
 			conf_index = 0;
 #if defined(BLOCK_NOEXEC_CONF)
 			/*
-			* Check the conf file is in a exec mount.
-			* With a W^X invariant, it excludes writable
-			* mounts.
-			*/
+			 * Check the conf file is in a exec mount.
+			 * With a W^X invariant, it excludes writable
+			 * mounts.
+			 */
 			struct statfs conf_statfs;
 			if (statfs(optarg, &conf_statfs) != 0)
 				err(1, "statfs(%s) failed.", optarg);
@@ -960,7 +984,8 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 				     optarg);
 #endif
 #if defined(ENFORCE_ROOTFS_CONF)
-			/* Make sure the conf file is in the same device as the rootfs. */
+			/* Make sure the conf file is in the same device as the
+			 * rootfs. */
 			struct stat root_stat;
 			struct stat conf_stat;
 			if (stat("/", &root_stat) != 0)
@@ -975,11 +1000,12 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 			if (!config_file)
 				err(1, "Failed to open %s", optarg);
 			if (!parse_config_file(config_file, conf_entry_list)) {
-				errx(1,
-				     "Unable to parse %s as Minijail conf file, "
-				     "please refer to minijail0(5) for syntax "
-				     "and examples.",
-				     optarg);
+				errx(
+				    1,
+				    "Unable to parse %s as Minijail conf file, "
+				    "please refer to minijail0(5) for syntax "
+				    "and examples.",
+				    optarg);
 			}
 			break;
 		}
@@ -1055,7 +1081,7 @@ int parse_args(struct minijail *j, int argc, char *const argv[],
 	 */
 	if (suppl_gids_count) {
 		minijail_set_supplementary_gids(j, suppl_gids_count,
-		                                suppl_gids);
+						suppl_gids);
 		free(suppl_gids);
 	}
 
