@@ -52,6 +52,7 @@ license {
 
 libminijailSrcFiles = [
     "bpf.c",
+    "landlock_util.c",
     "libminijail.c",
     "signal_handler.c",
     "syscall_filter.c",
@@ -77,7 +78,6 @@ cc_defaults {
         "-Wall",
         "-Werror",
     ],
-    c_std: "gnu11",
     target: {
         darwin: {
             enabled: false,

@@ -36,6 +36,7 @@
 #include <syscall.h>
 #include <unistd.h>
 
+#include "landlock_util.h"
 #include "libminijail-private.h"
 #include "libminijail.h"
 
@@ -190,6 +191,10 @@ struct minijail {
 	struct preserved_fd preserved_fds[MAX_PRESERVED_FDS];
 	size_t preserved_fd_count;
 	char *seccomp_policy_path;
+	/* Landlock ruleset file descriptor. */
+	int ruleset_fd;
+	/* Flag set to true if at least one landlock rule is used. */
+	bool landlock_used;
 };
 
 static void run_hooks_or_die(const struct minijail *j,
@@ -282,6 +287,36 @@ void minijail_preenter(struct minijail *j)
 	free_remounts_list(j);
 }
 
+/* Adds a rule to the landlock ruleset. */
+static bool add_fs_restriction_internal(struct minijail *j,
+					const char *path,
+					uint64_t landlock_flags)
+{
+	if (!j->landlock_used) {
+		struct minijail_landlock_ruleset_attr ruleset_attr = {
+			.handled_access_fs = ACCESS_FS_ROUGHLY_READ_EXECUTE |
+				ACCESS_FS_ROUGHLY_FULL_WRITE,
+		};
+		j->ruleset_fd = landlock_create_ruleset(
+			&ruleset_attr, sizeof(ruleset_attr), 0);
+		if (j->ruleset_fd < 0) {
+			const int err = errno;
+			pwarn("Failed to create a ruleset");
+			switch (err) {
+			case ENOSYS:
+				pwarn("Landlock is not supported by the current kernel");
+				break;
+			case EOPNOTSUPP:
+				pwarn("Landlock is currently disabled by kernel config");
+				break;
+			}
+			return false;
+		}
+		j->landlock_used = true;
+	}
+	return populate_ruleset_internal(path, j->ruleset_fd, landlock_flags);
+}
+
 /*
  * Strip out flags meant for the child.
  * We keep things that are inherited across execve(2).
@@ -324,6 +359,8 @@ struct minijail API *minijail_new(void)
 	struct minijail *j = calloc(1, sizeof(struct minijail));
 	if (j) {
 		j->remount_mode = MS_PRIVATE;
+		j->landlock_used = false;
+		j->ruleset_fd = -1;
 	}
 	return j;
 }
@@ -719,7 +756,7 @@ char API *minijail_get_original_path(struct minijail *j,
 		 *    "/chroot/path/exe", the source of that mount,
 		 *    "/some/path/exe" is what should be returned.
 		 */
-		if (!strcmp(b->dest, path_inside_chroot))
+		if (streq(b->dest, path_inside_chroot))
 			return strdup(b->src);
 
 		/*
@@ -812,6 +849,31 @@ int API minijail_create_session(struct minijail *j)
 	return 0;
 }
 
+int API minijail_add_fs_restriction_rx(struct minijail *j, const char *path)
+{
+	return !add_fs_restriction_internal(j, path,
+					    ACCESS_FS_ROUGHLY_READ_EXECUTE);
+}
+
+int API minijail_add_fs_restriction_ro(struct minijail *j, const char *path)
+{
+	return !add_fs_restriction_internal(j, path, ACCESS_FS_ROUGHLY_READ);
+}
+
+int API minijail_add_fs_restriction_rw(struct minijail *j, const char *path)
+{
+	return !add_fs_restriction_internal(j, path,
+		ACCESS_FS_ROUGHLY_READ | ACCESS_FS_ROUGHLY_BASIC_WRITE);
+}
+
+int API minijail_add_fs_restriction_advanced_rw(struct minijail *j,
+						const char *path)
+{
+	return !add_fs_restriction_internal(j, path,
+		ACCESS_FS_ROUGHLY_READ | ACCESS_FS_ROUGHLY_FULL_WRITE);
+}
+
+
 int API minijail_mount_with_data(struct minijail *j, const char *src,
 				 const char *dest, const char *type,
 				 unsigned long flags, const char *data)
@@ -840,7 +902,7 @@ int API minijail_mount_with_data(struct minijail *j, const char *src,
 		 * people use these in practice, it's probably OK.  If they want
 		 * the kernel defaults, they can pass data="" instead of NULL.
 		 */
-		if (!strcmp(type, "tmpfs")) {
+		if (streq(type, "tmpfs")) {
 			/* tmpfs defaults to mode=1777 and size=50%. */
 			data = "mode=0755,size=10M";
 		}
@@ -898,7 +960,12 @@ int API minijail_bind(struct minijail *j, const char *src, const char *dest,
 	if (!writeable)
 		flags |= MS_RDONLY;
 
-	return minijail_mount(j, src, dest, "", flags);
+	/*
+	 * |type| is ignored for bind mounts, use it to signal that this mount
+	 * came from minijail_bind().
+	 * TODO(b/238362528): Implement a better way to signal this.
+	 */
+	return minijail_mount(j, src, dest, "minijail_bind", flags);
 }
 
 int API minijail_add_remount(struct minijail *j, const char *mount_name,
@@ -1693,7 +1760,9 @@ static int mount_one(const struct minijail *j, struct mountpoint *m,
 {
 	int ret;
 	char *dest;
-	int remount = 0;
+	bool do_remount = false;
+	bool has_bind_flag = !!(m->flags & MS_BIND);
+	bool has_remount_flag = !!(m->flags & MS_REMOUNT);
 	unsigned long original_mnt_flags = 0;
 
 	/* We assume |dest| has a leading "/". */
@@ -1708,39 +1777,60 @@ static int mount_one(const struct minijail *j, struct mountpoint *m,
 			return -ENOMEM;
 	}
 
-	ret =
-	    setup_mount_destination(m->src, dest, j->uid, j->gid,
-				    (m->flags & MS_BIND), &original_mnt_flags);
+	ret = setup_mount_destination(m->src, dest, j->uid, j->gid,
+				      has_bind_flag);
 	if (ret) {
 		warn("cannot create mount target '%s'", dest);
 		goto error;
 	}
 
 	/*
-	 * Bind mounts that change the 'ro' flag have to be remounted since
-	 * 'bind' and other flags can't both be specified in the same command.
-	 * Remount after the initial mount.
+	 * Remount bind mounts that:
+	 * - Come from the minijail_bind() API, and
+	 * - Add the 'ro' flag
+	 * since 'bind' and other flags can't both be specified in the same
+	 * mount(2) call.
+	 * Callers using minijail_mount() to perform bind mounts are expected to
+	 * know what they're doing and call minijail_mount() with MS_REMOUNT as
+	 * needed.
+	 * Therefore, if the caller is asking for a remount (using MS_REMOUNT),
+	 * there is no need to do an extra remount here.
 	 */
-	if ((m->flags & MS_BIND) &&
-	    ((m->flags & MS_RDONLY) != (original_mnt_flags & MS_RDONLY))) {
-		remount = 1;
+	if (has_bind_flag && strcmp(m->type, "minijail_bind") == 0 &&
+	    !has_remount_flag) {
 		/*
-		 * Restrict the mount flags to those that are user-settable in a
-		 * MS_REMOUNT request, but excluding MS_RDONLY. The
-		 * user-requested mount flags will dictate whether the remount
-		 * will have that flag or not.
+		 * Grab the mount flags of the source. These are used to figure
+		 * out whether the bind mount needs to be remounted read-only.
 		 */
-		original_mnt_flags &= (MS_USER_SETTABLE_MASK & ~MS_RDONLY);
+		if (get_mount_flags(m->src, &original_mnt_flags)) {
+			warn("cannot get mount flags for '%s'", m->src);
+			goto error;
+		}
+
+		if ((m->flags & MS_RDONLY) !=
+		    (original_mnt_flags & MS_RDONLY)) {
+			do_remount = 1;
+			/*
+			 * Restrict the mount flags to those that are
+			 * user-settable in a MS_REMOUNT request, but excluding
+			 * MS_RDONLY. The user-requested mount flags will
+			 * dictate whether the remount will have that flag or
+			 * not.
+			 */
+			original_mnt_flags &=
+			    (MS_USER_SETTABLE_MASK & ~MS_RDONLY);
+		}
 	}
 
 	ret = mount(m->src, dest, m->type, m->flags, m->data);
 	if (ret) {
-		pwarn("cannot bind-mount '%s' as '%s' with flags %#lx", m->src,
-		      dest, m->flags);
+		pwarn("cannot mount '%s' as '%s' with flags %#lx", m->src, dest,
+		      m->flags);
 		goto error;
 	}
 
-	if (remount) {
+	/* Remount *after* the initial mount. */
+	if (do_remount) {
 		ret =
 		    mount(m->src, dest, NULL,
 			  m->flags | original_mnt_flags | MS_REMOUNT, m->data);
@@ -1774,6 +1864,8 @@ static void process_mounts_or_die(const struct minijail *j)
 		pdie("mount_dev failed");
 
 	if (j->mounts_head && mount_one(j, j->mounts_head, dev_path)) {
+		warn("mount_one failed with /dev at '%s'", dev_path);
+
 		if (dev_path)
 			mount_dev_cleanup(dev_path);
 
@@ -3493,6 +3585,21 @@ static int minijail_run_internal(struct minijail *j,
 		return 0;
 
 	/*
+	 * Apply Landlock restrictions if enabled. Restrictions are applied after
+	 * forking and before execve, because this helps prevent interfering with
+	 * other minijail system calls.
+	 */
+	if (j->landlock_used && j->ruleset_fd >= 0) {
+		if (landlock_restrict_self(j->ruleset_fd, 0)) {
+			pdie("Failed to enforce ruleset");
+		}
+	}
+	if (j->ruleset_fd >= 0) {
+		close(j->ruleset_fd);
+		j->ruleset_fd = -1;
+	}
+
+	/*
 	 * We're going to execve(), so make sure any remaining resources are
 	 * freed. Exceptions are:
 	 *  1. The child environment. No need to worry about freeing it since
@@ -3647,6 +3754,8 @@ void API minijail_destroy(struct minijail *j)
 {
 	size_t i;
 
+	if (j->ruleset_fd >= 0)
+		close(j->ruleset_fd);
 	if (j->filter_prog) {
 		free(j->filter_prog->filter);
 		free(j->filter_prog);
